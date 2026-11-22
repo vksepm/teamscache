@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/stn1slv/teamscache/internal/feedback"
 	"github.com/stn1slv/teamscache/internal/idbtest"
 	"github.com/stn1slv/teamscache/internal/service"
 )
@@ -26,15 +27,22 @@ func connect(t *testing.T, account string) *mcp.ClientSession {
 
 func connectCache(t *testing.T, account, dir string) *mcp.ClientSession {
 	t.Helper()
+	return connectWith(t, account, dir, nil, "test")
+}
+
+// connectWith connects a client called clientName to a server that has the
+// feedback store, when it is not nil.
+func connectWith(t *testing.T, account, dir string, store *feedback.Store, clientName string) *mcp.ClientSession {
+	t.Helper()
 	cache := service.NewCache(dir, time.Minute, slog.New(slog.DiscardHandler))
-	server := New(cache, service.Options{MaxContent: 6, Now: time.Now}, "test", account)
+	server := New(cache, service.Options{MaxContent: 6, Now: time.Now}, "test", account, store)
 
 	ctx := context.Background()
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
 	serverSession, err := server.Connect(ctx, serverTransport, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = serverSession.Close() })
-	client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "test"}, nil)
+	client := mcp.NewClient(&mcp.Implementation{Name: clientName, Version: "1.2"}, nil)
 	session, err := client.Connect(ctx, clientTransport, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = session.Close() })

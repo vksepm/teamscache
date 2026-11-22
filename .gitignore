@@ -38,3 +38,11 @@ go.work.sum
 
 # GoReleaser output
 /dist/
+
+# CodeGraph output directory
+.codegraph/
+
+.mcp.json
+
+docs/
+.codemie/

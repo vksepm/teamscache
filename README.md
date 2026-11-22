@@ -69,6 +69,7 @@ teamscache search "quarterly budget"     # text in message content or sender nam
 teamscache conversations                 # chats and channels (id, title, type, last message)
 teamscache read "19:abc@thread.v2"       # last 50 messages of one conversation, oldest first
 teamscache dump                          # accounts, conversations, messages and mentions in one JSON object
+teamscache feedback                      # feedback that agents reported through the MCP server, newest first
 ```
 
 All commands print JSON to stdout and a short summary to stderr, for example `# 12 result(s), 0 record(s) skipped, 0 damaged section(s)`. Skipped records could not be decoded. Damaged sections are unreadable file sections or missing referenced blob files, and are counted separately.
@@ -84,7 +85,8 @@ All commands print JSON to stdout and a short summary to stderr, for example `# 
 | `mentions` | `--limit 100`, `--days 0`, `--unread` (`false`) |
 | `overview` | `--days 7` |
 | `dump` | `--days 0` |
-| `mcp` | `--cache-ttl 180s` (Go duration, such as `180s` or `3m`) |
+| `feedback` | `--limit 50`, `--days 0` |
+| `mcp` | `--cache-ttl 180s` (Go duration, such as `180s` or `3m`), `--feedback-rate-limit 10`, `--feedback-rate-window 10m` |
 
 In those command flags, `--limit N` sets the maximum number of results (`0` means no limit). `--days N` keeps only items from the last N days (`0` means all dates, and `--limit` still applies). `--unread` keeps only unread @-mentions.
 
@@ -96,6 +98,7 @@ Global flags:
 | `--leveldb PATH` | Read this cache folder instead of the auto-discovered one. Cannot be combined with `--profile`. |
 | `--profile NAME` | Choose a discovered WebView2 profile by folder name (see `teamscache profiles`). Cannot be combined with `--leveldb`. |
 | `--max-content N` | Characters of message content in CLI `mentions`, `overview`, `dump`, and all MCP results (`0` means no limit, default `600`). CLI `conversations`, `read`, `recent`, and `search` print full content. |
+| `--feedback-file PATH` | JSONL file for agent feedback (default `~/.teamscache/feedback.jsonl`). Used by `mcp` and `feedback`. |
 | `-v`, `--verbose` | Log details, such as skipped records, to stderr. |
 
 Environment variables:
@@ -106,6 +109,9 @@ Environment variables:
 | `TEAMSCACHE_PROFILE` | Default for `--profile` (cannot be set with `TEAMSCACHE_LEVELDB`). |
 | `TEAMSCACHE_MAX_CONTENT` | Default for `--max-content`. |
 | `TEAMSCACHE_CACHE_TTL` | Integer number of seconds the MCP server reuses a parsed cache (default `180`). |
+| `TEAMSCACHE_FEEDBACK_FILE` | Default for `--feedback-file`. |
+| `TEAMSCACHE_FEEDBACK_RATE_LIMIT` | Default for `--feedback-rate-limit`. |
+| `TEAMSCACHE_FEEDBACK_RATE_WINDOW` | Integer number of seconds for the default of `--feedback-rate-window` (default `600`). |
 
 The cache has no general read or unread marker. The read state of @-mentions is the only read state it keeps, so `mentions --unread` is the reliable way to find what needs your attention.
 
@@ -144,10 +150,22 @@ Pass `--max-content 0` for full message content in MCP tool results, or `--accou
 | `list_conversations` | Chats and channels with their titles and IDs. | `limit` (`100`), `account` |
 | `read_conversation` | Last messages of one conversation, oldest first. Pass `limit: 0` for all cached messages. | `conversation_id` (required), `limit` (`50`), `account` |
 | `list_accounts` | Accounts in the cache; use `key` as the `account` filter. | none |
+| `report_feedback` | The agent reports a problem with these tools. Appended to the feedback file, never sent anywhere. | `category` and `summary` (required), `details`, `related_tool`, `proposed_fix` |
 
 The server parses the cache on the first tool call and keeps the result in memory. It parses again when the TTL ends or when Teams writes new data.
 
 Every tool response keeps its rows in `result` and includes `skipped_records`, `damaged_sections`, and `partial`. When `partial` is true, some cache data could not be read, so an empty result does not confirm that no matching messages exist.
+
+### Agent feedback
+
+`report_feedback` lets the calling agent say what went wrong: a tool error that looks wrong, an output that contradicts what you see in Teams, a search that missed a message the agent found another way, a misleading tool description, or a capability that does not exist. `category` is one of `bug`, `unexpected_output`, `missing_capability`, `tool_description`, `search_miss` and `other`. It returns `{"request_id": "...", "report": {"category", "received", "deduplicated"}}`.
+
+Each report is one line in `~/.teamscache/feedback.jsonl` (change it with `--feedback-file`). The file is only ever appended to, and it is created with owner-only permissions. Nothing is sent over the network. Review the reports with `teamscache feedback`, then decide yourself whether to open a GitHub issue.
+
+- **Rate limit:** each MCP client (the `clientInfo.name` from the handshake, such as `claude-code`) can send 10 reports per 10 minutes. Change this with `--feedback-rate-limit` and `--feedback-rate-window`. The count is read from the file, so it survives a restart and is shared by every server process that uses the file. A refused call is a tool error with `retry_after_seconds`.
+- **Duplicates:** an identical report from the same client inside the window is not stored again, answers `"deduplicated": true` and does not use up the limit.
+- **Limits on text:** the summary is at most 200 characters, `details` and `proposed_fix` at most 2000.
+- **No redaction:** the tool description tells the agent not to include message text, names, email addresses or tenant, user and conversation ids, but the server stores what the agent sends. Check the file before you share it.
 
 ## How it works
 
@@ -165,7 +183,7 @@ The LevelDB, IndexedDB and V8 decoding is a Go port of parts of [ccl_chromium_re
 
 ## Privacy
 
-The tool is read-only and makes no network calls. The temporary copy of the cache is created with owner-only permissions and removed after each run. Output can contain message content from all tenants in the cache, so treat it as confidential.
+The tool never changes the Teams cache and makes no network calls. The one thing it writes is the feedback file that `report_feedback` appends to, described above. The temporary copy of the cache is created with owner-only permissions and removed after each run. Output can contain message content from all tenants in the cache, so treat it as confidential.
 
 ## Development
 

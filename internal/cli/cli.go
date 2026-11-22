@@ -16,6 +16,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/spf13/cobra"
 
+	"github.com/stn1slv/teamscache/internal/feedback"
 	"github.com/stn1slv/teamscache/internal/mcpserver"
 	"github.com/stn1slv/teamscache/internal/service"
 	"github.com/stn1slv/teamscache/internal/teams"
@@ -30,6 +31,10 @@ const (
 	envProfile    = "TEAMSCACHE_PROFILE"
 	envMaxContent = "TEAMSCACHE_MAX_CONTENT"
 	envCacheTTL   = "TEAMSCACHE_CACHE_TTL"
+
+	envFeedbackFile   = "TEAMSCACHE_FEEDBACK_FILE"
+	envFeedbackLimit  = "TEAMSCACHE_FEEDBACK_RATE_LIMIT"
+	envFeedbackWindow = "TEAMSCACHE_FEEDBACK_RATE_WINDOW"
 )
 
 type globals struct {
@@ -38,9 +43,11 @@ type globals struct {
 	account    string
 	maxContent int
 	verbose    bool
-	ctx        context.Context
-	stdout     io.Writer
-	stderr     io.Writer
+
+	feedbackFile string
+	ctx          context.Context
+	stdout       io.Writer
+	stderr       io.Writer
 }
 
 func (g *globals) logger() *slog.Logger {
@@ -53,6 +60,13 @@ func (g *globals) logger() *slog.Logger {
 
 func (g *globals) options() service.Options {
 	return service.Options{MaxContent: g.maxContent, Now: time.Now}
+}
+
+func envString(name, def string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return def
 }
 
 func envInt(name string, def int) int {
@@ -87,6 +101,7 @@ func NewRootCommand(version string, stdout, stderr io.Writer) *cobra.Command {
 	flags.StringVar(&g.account, "account", "", "only this account, as <tenantId>:<userId> (see the accounts command)")
 	flags.IntVar(&g.maxContent, "max-content", envInt(envMaxContent, 600), "characters of message content in mentions, the overview and MCP results, 0 for no limit (env "+envMaxContent+")")
 	flags.BoolVarP(&g.verbose, "verbose", "v", false, "log details, such as skipped records, to stderr")
+	flags.StringVar(&g.feedbackFile, "feedback-file", envString(envFeedbackFile, feedback.DefaultPath()), "JSONL file for the feedback that agents report (default ~/.teamscache/feedback.jsonl; env "+envFeedbackFile+")")
 
 	root.AddCommand(
 		accountsCommand(g),
@@ -98,6 +113,7 @@ func NewRootCommand(version string, stdout, stderr io.Writer) *cobra.Command {
 		mentionsCommand(g),
 		overviewCommand(g),
 		dumpCommand(g),
+		feedbackCommand(g),
 		mcpCommand(g, version),
 	)
 	return root
@@ -114,7 +130,7 @@ func validate(cmd *cobra.Command, g *globals) error {
 	if !leveldbFlag && !profileFlag && g.leveldb != "" && g.profile != "" {
 		return fmt.Errorf("%w: %s and %s cannot both be set", ErrInvalidFlag, envLevelDB, envProfile)
 	}
-	for _, name := range []string{"max-content", "limit", "days", "cache-ttl"} {
+	for _, name := range []string{"max-content", "limit", "days", "cache-ttl", "feedback-rate-limit", "feedback-rate-window"} {
 		f := cmd.Flags().Lookup(name)
 		if f == nil {
 			continue
@@ -349,25 +365,83 @@ func dumpCommand(g *globals) *cobra.Command {
 }
 
 func mcpCommand(g *globals, version string) *cobra.Command {
-	var ttl time.Duration
+	var ttl, rateWindow time.Duration
+	var rateLimit int
 	cmd := &cobra.Command{
 		Use:   "mcp",
-		Short: "Run the read-only MCP server on stdin and stdout",
-		Long: "Run the read-only MCP server on stdin and stdout.\n" +
-			"The cache is parsed on the first tool call and kept in memory until the TTL ends or Teams writes new data.",
+		Short: "Run the MCP server on stdin and stdout; it reads the Teams cache and only writes agent feedback",
+		Long: "Run the MCP server on stdin and stdout.\n" +
+			"The cache is parsed on the first tool call and kept in memory until the TTL ends or Teams writes new data.\n" +
+			"The server never changes the Teams cache. Its report_feedback tool appends agent feedback to the feedback file.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			path, err := g.cachePath(cmd)
 			if err != nil {
 				return err
 			}
+			store, err := g.feedbackStore(rateLimit, rateWindow)
+			if err != nil {
+				return err
+			}
 			cache := service.NewCache(path, ttl, g.logger())
-			server := mcpserver.New(cache, g.options(), version, g.account)
+			server := mcpserver.New(cache, g.options(), version, g.account, store)
 			return server.Run(cmd.Context(), &mcp.StdioTransport{})
 		},
 	}
 	defTTL := time.Duration(envInt(envCacheTTL, 180)) * time.Second
 	cmd.Flags().DurationVar(&ttl, "cache-ttl", defTTL, "how long a parsed cache is reused (env "+envCacheTTL+", in seconds)")
+	defWindow := time.Duration(envInt(envFeedbackWindow, int(feedback.DefaultWindow/time.Second))) * time.Second
+	cmd.Flags().IntVar(&rateLimit, "feedback-rate-limit", envInt(envFeedbackLimit, feedback.DefaultLimit), "feedback reports one MCP client can send per window (env "+envFeedbackLimit+")")
+	cmd.Flags().DurationVar(&rateWindow, "feedback-rate-window", defWindow, "window of the feedback rate limit (env "+envFeedbackWindow+", in seconds)")
+	return cmd
+}
+
+// feedbackStore returns the store behind report_feedback. Without a feedback
+// file the tool is not offered.
+func (g *globals) feedbackStore(limit int, window time.Duration) (*feedback.Store, error) {
+	if g.feedbackFile == "" {
+		g.logger().Warn("report_feedback is disabled: the home folder is unknown; set --feedback-file")
+		return nil, nil
+	}
+	store, err := feedback.NewStore(g.feedbackFile, limit, window, time.Now)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidFlag, err)
+	}
+	return store, nil
+}
+
+func feedbackCommand(g *globals) *cobra.Command {
+	var limit, days int
+	cmd := &cobra.Command{
+		Use:   "feedback",
+		Short: "Show the feedback that agents reported through the MCP server, newest first",
+		Args:  cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if g.feedbackFile == "" {
+				return fmt.Errorf("%w: no feedback file; set --feedback-file or %s", ErrInvalidFlag, envFeedbackFile)
+			}
+			if err := g.ctx.Err(); err != nil {
+				return err
+			}
+			var since time.Time
+			if days > 0 {
+				since = time.Now().AddDate(0, 0, -days)
+			}
+			entries, err := feedback.List(g.feedbackFile, since, limit)
+			if err != nil {
+				return err
+			}
+			if err := encodeJSON(g.stdout, entries); err != nil {
+				return err
+			}
+			if _, err := fmt.Fprintf(g.stderr, "# %d result(s)\n", len(entries)); err != nil {
+				return fmt.Errorf("write summary: %w", err)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().IntVar(&limit, "limit", 50, limitHelp)
+	cmd.Flags().IntVar(&days, "days", 0, "number of days, 0 for all")
 	return cmd
 }
 

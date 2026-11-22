@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/stn1slv/teamscache/internal/feedback"
 	"github.com/stn1slv/teamscache/internal/idbtest"
 )
 
@@ -208,4 +210,96 @@ func TestDumpCommandFiltersAccountAndDays(t *testing.T) {
 	assert.Len(t, got.Conversations, 1)
 	assert.Len(t, got.Messages, 2)
 	assert.Len(t, got.Mentions, 1)
+}
+
+// seedFeedback writes n reports, one minute apart ending now, and returns the file.
+func seedFeedback(t *testing.T, n int) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "feedback.jsonl")
+	now := time.Now().Add(-time.Duration(n) * time.Minute)
+	store, err := feedback.NewStore(path, n, time.Hour, func() time.Time { now = now.Add(time.Minute); return now })
+	require.NoError(t, err)
+	for i := range n {
+		_, err := store.Submit(feedback.Client{Name: "agent"}, feedback.Input{Category: "bug", Summary: fmt.Sprintf("problem %d", i)})
+		require.NoError(t, err)
+	}
+	return path
+}
+
+func TestFeedbackCommand(t *testing.T) {
+	t.Parallel()
+	path := seedFeedback(t, 3)
+
+	stdout, stderr, err := runCLI(t, "feedback", "--feedback-file", path)
+	require.NoError(t, err)
+	var rows []map[string]any
+	require.NoError(t, json.Unmarshal([]byte(stdout), &rows), stdout)
+	require.Len(t, rows, 3)
+	assert.Equal(t, "problem 2", rows[0]["summary"], "newest first")
+	assert.Equal(t, "# 3 result(s)\n", stderr)
+
+	stdout, _, err = runCLI(t, "feedback", "--feedback-file", path, "--limit", "1")
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal([]byte(stdout), &rows))
+	assert.Len(t, rows, 1)
+
+	stdout, _, err = runCLI(t, "feedback", "--feedback-file", path, "--days", "1")
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal([]byte(stdout), &rows))
+	assert.Len(t, rows, 3)
+}
+
+func TestFeedbackCommandWithoutAFileIsEmpty(t *testing.T) {
+	t.Parallel()
+
+	stdout, stderr, err := runCLI(t, "feedback", "--feedback-file", filepath.Join(t.TempDir(), "none.jsonl"))
+
+	require.NoError(t, err)
+	assert.JSONEq(t, "[]", stdout)
+	assert.Equal(t, "# 0 result(s)\n", stderr)
+}
+
+func TestFeedbackCommandNeedsAFile(t *testing.T) {
+	t.Parallel()
+
+	_, _, err := runCLI(t, "feedback", "--feedback-file", "")
+
+	require.ErrorIs(t, err, ErrInvalidFlag)
+}
+
+func TestFeedbackFileEnvDefault(t *testing.T) {
+	path := seedFeedback(t, 2)
+	t.Setenv(envFeedbackFile, path)
+
+	stdout, _, err := runCLI(t, "feedback")
+
+	require.NoError(t, err)
+	var rows []map[string]any
+	require.NoError(t, json.Unmarshal([]byte(stdout), &rows))
+	assert.Len(t, rows, 2)
+}
+
+func TestMCPFeedbackRateFlagsAreValidated(t *testing.T) {
+	t.Parallel()
+	file := filepath.Join(t.TempDir(), "feedback.jsonl")
+
+	for _, args := range [][]string{
+		{"mcp", "--feedback-file", file, "--feedback-rate-limit", "-1"},
+		{"mcp", "--feedback-file", file, "--feedback-rate-window", "-1s"},
+		{"mcp", "--feedback-file", file, "--feedback-rate-limit", "0"},
+		{"mcp", "--feedback-file", file, "--feedback-rate-window", "0s"},
+	} {
+		_, _, err := runCLI(t, args...)
+		require.ErrorIs(t, err, ErrInvalidFlag, args)
+	}
+}
+
+func TestFeedbackStoreIsOptionalWithoutAFile(t *testing.T) {
+	t.Parallel()
+	g := &globals{stderr: &bytes.Buffer{}}
+
+	store, err := g.feedbackStore(10, time.Minute)
+
+	require.NoError(t, err)
+	assert.Nil(t, store)
 }

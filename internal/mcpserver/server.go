@@ -1,5 +1,5 @@
 // Package mcpserver exposes the Teams cache over the Model Context Protocol,
-// read-only.
+// read-only. Its one write is report_feedback, which appends to a local file.
 package mcpserver
 
 import (
@@ -10,6 +10,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/stn1slv/teamscache/internal/feedback"
 	"github.com/stn1slv/teamscache/internal/leveldb"
 	"github.com/stn1slv/teamscache/internal/service"
 	"github.com/stn1slv/teamscache/internal/teams"
@@ -78,6 +79,34 @@ type overviewArgs struct {
 	Limit *int `json:"limit,omitempty" jsonschema:"maximum number of results (default 100)"`
 }
 
+type feedbackArgs struct {
+	Category    string `json:"category" jsonschema:"one of: bug, unexpected_output, missing_capability, tool_description, search_miss, other"`
+	Summary     string `json:"summary" jsonschema:"one sentence describing the problem, at most 200 characters"`
+	Details     string `json:"details,omitempty" jsonschema:"what you called, what you expected and what happened, at most 2000 characters"`
+	RelatedTool string `json:"related_tool,omitempty" jsonschema:"name of the tool this is about, for example search_messages"`
+	ProposedFix string `json:"proposed_fix,omitempty" jsonschema:"a change to the tool, its description or its schema that would help, at most 2000 characters"`
+}
+
+type feedbackReport struct {
+	Category     string `json:"category"`
+	Received     bool   `json:"received"`
+	Deduplicated bool   `json:"deduplicated"`
+}
+
+// FeedbackResult is the output of report_feedback.
+type FeedbackResult struct {
+	RequestID string         `json:"request_id"`
+	Report    feedbackReport `json:"report"`
+}
+
+const reportFeedbackDescription = "Report a problem with these Teams tools so that the maintainer can fix it: a tool error that looks wrong, " +
+	"an output that contradicts what the user sees in Teams, a search that missed something you found another way, " +
+	"a misleading tool description, or a capability the user asked for that does not exist. " +
+	"Do not use it for ordinary empty results or for the user's own mistakes. " +
+	"The report is saved in a local file and is not sent anywhere. Rate limited; if it is refused, go back to the user's task and do not retry. " +
+	"NEVER include message text, people's names, email addresses, or tenant, user and conversation ids. " +
+	"Describe the problem in general terms, for example 'search_messages returned no rows for a term that read_conversation shows'."
+
 // ErrInvalidArgument reports a tool argument the server does not accept.
 var ErrInvalidArgument = errors.New("invalid argument")
 
@@ -143,8 +172,9 @@ func (s *server) prepare(ctx context.Context, requested string, limit *int) (*se
 }
 
 // New returns an MCP server with the read-only tools. When account is not
-// empty, every tool serves only that account.
-func New(cache *service.Cache, opts service.Options, version, account string) *mcp.Server {
+// empty, every tool serves only that account. When store is not nil, it also
+// has report_feedback, which appends to the store's file and nothing else.
+func New(cache *service.Cache, opts service.Options, version, account string, store *feedback.Store) *mcp.Server {
 	srv := &server{cache: cache, opts: opts, account: account}
 	s := mcp.NewServer(&mcp.Implementation{Name: "teamscache", Version: version}, nil)
 	readOnly := &mcp.ToolAnnotations{ReadOnlyHint: true}
@@ -306,5 +336,48 @@ func New(cache *service.Cache, opts service.Options, version, account string) *m
 			return nil, result(snap, rows), nil
 		})
 
+	if store != nil {
+		addReportFeedback(s, store)
+	}
 	return s
+}
+
+// addReportFeedback registers report_feedback. It does not read the Teams
+// cache, so it works when the cache is missing or damaged.
+func addReportFeedback(s *mcp.Server, store *feedback.Store) {
+	// Unset hints default to destructive and open-world, which makes strict
+	// hosts warn about a tool that only appends to a local file.
+	no := false
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "report_feedback",
+		Description: reportFeedbackDescription,
+		Annotations: &mcp.ToolAnnotations{DestructiveHint: &no, IdempotentHint: false, OpenWorldHint: &no},
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in feedbackArgs) (*mcp.CallToolResult, FeedbackResult, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, FeedbackResult{}, err
+		}
+		receipt, err := store.Submit(clientOf(req), feedback.Input{
+			Category: in.Category, Summary: in.Summary, Details: in.Details,
+			RelatedTool: in.RelatedTool, ProposedFix: in.ProposedFix,
+		})
+		if err != nil {
+			return nil, FeedbackResult{}, err
+		}
+		return nil, FeedbackResult{
+			RequestID: receipt.ID,
+			Report:    feedbackReport{Category: receipt.Category, Received: true, Deduplicated: receipt.Deduplicated},
+		}, nil
+	})
+}
+
+// clientOf returns the MCP client that sent req, from its initialize request.
+func clientOf(req *mcp.CallToolRequest) feedback.Client {
+	if req == nil || req.Session == nil {
+		return feedback.Client{}
+	}
+	params := req.Session.InitializeParams()
+	if params == nil || params.ClientInfo == nil {
+		return feedback.Client{}
+	}
+	return feedback.Client{Name: params.ClientInfo.Name, Version: params.ClientInfo.Version}
 }
